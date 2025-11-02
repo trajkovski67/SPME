@@ -1,0 +1,466 @@
+module PME_main
+    use iso_fortran_env, only : output_unit, error_unit
+    use print_matrix,   only : write_vector, write_matrix
+    use, intrinsic :: iso_c_binding, only: c_loc, c_double_complex, c_int, c_ptr, c_double
+    use omp_lib
+    implicit none
+    private
+    public :: PME_prog
+
+    integer, parameter :: wp = selected_real_kind(15)
+
+contains
+
+!=======================================================================
+subroutine PME_prog(input)
+    implicit none
+    integer, intent(in) :: input
+    real(wp) :: a,b,c,alpha,beta,gamma,volume,ewald_coeff,pi
+    real(wp) :: direct_sum,energy,benchmark
+    real(wp) :: a1(3),rx(3),ry(3),rz(3),t1,t2
+    integer :: io,i,j,no_ion,k1,k2,k3,Rcut,Gcut,p
+    real(wp), allocatable :: ion_frac_coord(:,:),ion_coord(:,:)
+    real(wp), allocatable :: coord_rec(:,:),forces(:,:),forces_spme(:,:)
+    real(wp), allocatable :: atom_madelung_rec(:),atom_madelung_real(:), &
+                             atom_madelung_conv_rec(:)
+    real(wp) :: coord(3,3)
+    character(len=100) :: line,title
+
+    read(input,'(A)') line; read(line,*,iostat=io) title
+    read(input,'(A)') line; read(line,*,iostat=io) a,b,c
+    read(input,'(A)') line; read(line,*,iostat=io) alpha,beta,gamma
+    pi=3.141592653589793_wp
+    alpha=alpha*pi/180.0_wp; beta=beta*pi/180.0_wp; gamma=gamma*pi/180.0_wp
+
+    read(input,'(A)') line
+    read(line,*,iostat=io) no_ion
+    allocate(ion_frac_coord(no_ion,4))
+    do i=1,no_ion
+       read(input,'(A)') line
+       read(line,*,iostat=io) ion_frac_coord(i,1:4)
+    enddo
+
+    coord=0.0_wp
+    coord(1,:)=(/a,0.0_wp,0.0_wp/)
+    coord(2,:)=(/b*cos(gamma),b*sin(gamma),0.0_wp/)
+    coord(3,:)=(/c*cos(beta), c*(cos(alpha)-cos(beta)*cos(gamma))/sin(gamma), &
+                c*sqrt(1.0_wp-cos(beta)**2-((cos(alpha)-cos(beta)*cos(gamma)) / sin(gamma))**2)/)
+
+    read(input,'(A)') line; read(line,*,iostat=io) k1,k2,k3
+    read(input,'(A)') line; read(line,*,iostat=io) ewald_coeff,p,Rcut,Gcut
+
+    allocate(forces(no_ion,3),forces_spme(no_ion,3))
+    allocate(atom_madelung_rec(no_ion),atom_madelung_real(no_ion),atom_madelung_conv_rec(no_ion))
+    atom_madelung_real=0.0_wp; atom_madelung_conv_rec=0.0_wp
+
+    call compute_cross_product(coord(:,1),coord(:,2),a1)
+    volume=a*b*c*sqrt(1.0_wp-cos(alpha)**2-cos(beta)**2-cos(gamma)**2+ &
+             2.0_wp*cos(alpha)*cos(beta)*cos(gamma))
+
+    allocate(coord_rec(3,3)); coord_rec=0.0_wp
+    call compute_cross_product(coord(:,1),coord(:,2),coord_rec(:,3))
+    call compute_cross_product(coord(:,1),coord(:,3),coord_rec(:,2))
+    call compute_cross_product(coord(:,2),coord(:,3),coord_rec(:,1))
+    coord_rec=abs(coord_rec)/volume
+    rx=coord(:,1); ry=coord(:,2); rz=coord(:,3)
+
+    allocate(ion_coord(no_ion,3)); ion_coord=0.0_wp
+    do i=1,no_ion
+       do j=1,3
+         ion_coord(i,:)=ion_coord(i,:)+ion_frac_coord(i,j)*coord(:,j)
+       enddo
+    enddo
+
+    call cpu_time(t1)
+    direct_sum=0.0_wp
+    call direct_space_sum(no_ion,Rcut,ion_coord,ion_frac_coord,coord,ewald_coeff, &
+                          direct_sum,atom_madelung_real)
+    call cpu_time(t2)
+
+    do i=1,no_ion
+       direct_sum=direct_sum-ewald_coeff*(ion_frac_coord(i,4))**2/sqrt(pi)
+       atom_madelung_real(i)=atom_madelung_real(i)-2.0_wp*ewald_coeff*ion_frac_coord(i,4)/sqrt(pi)
+    enddo
+        print*, 'Time elapsed (direct space):', t2-t1
+    call reciprocal_ewald(no_ion,ion_frac_coord,ion_coord,coord_rec,Gcut,ewald_coeff,volume,benchmark,atom_madelung_conv_rec)
+    call spme_energy(ewald_coeff,[k1,k2,k3],p,rx,ry,rz,ion_coord,ion_frac_coord(:,4),no_ion,energy,atom_madelung_rec)
+
+
+           print*, 'ELECTROSTATIC ENERGY: PME', direct_sum + energy
+        print*, "ELECTROSTATIC ENERGY: EWALD", benchmark + direct_sum
+        print*, 'DIRECT SPACE', direct_sum
+        print*, 'RECIPROCAL SPACE: PME:', energy
+        print*, 'RECIPROCAL SPACE: EWALD', benchmark
+        print*, "RECIPROCAL SPACE: PME-EWALD", energy-benchmark 
+    !call write_vector(atom_madelung_real+atom_madelung_rec,"Madelung SPME")
+    !call write_vector(atom_madelung_real+atom_madelung_conv_rec,"Madelung Conv")
+
+end subroutine PME_prog
+
+!============================================================
+subroutine compute_cross_product(a,b,c)
+ real(wp),intent(in)::a(3),b(3); real(wp),intent(out)::c(3)
+ c(1)=a(2)*b(3)-a(3)*b(2)
+ c(2)=a(3)*b(1)-a(1)*b(3)
+ c(3)=a(1)*b(2)-a(2)*b(1)
+end subroutine
+
+pure function cross_product(u,v) result(w)
+ real(wp),intent(in)::u(3),v(3); real(wp)::w(3)
+ w(1)=u(2)*v(3)-u(3)*v(2)
+ w(2)=u(3)*v(1)-u(1)*v(3)
+ w(3)=u(1)*v(2)-u(2)*v(1)
+end function
+
+subroutine invert_3x3_matrix(A,Ainv)
+ real(wp),intent(in)::A(3,3); real(wp),intent(out)::Ainv(3,3); real(wp)::det
+ Ainv(1,1)=A(2,2)*A(3,3)-A(2,3)*A(3,2)
+ Ainv(1,2)=A(1,3)*A(3,2)-A(1,2)*A(3,3)
+ Ainv(1,3)=A(1,2)*A(2,3)-A(1,3)*A(2,2)
+ Ainv(2,1)=A(2,3)*A(3,1)-A(2,1)*A(3,3)
+ Ainv(2,2)=A(1,1)*A(3,3)-A(1,3)*A(3,1)
+ Ainv(2,3)=A(1,3)*A(2,1)-A(1,1)*A(2,3)
+ Ainv(3,1)=A(2,1)*A(3,2)-A(2,2)*A(3,1)
+ Ainv(3,2)=A(1,2)*A(3,1)-A(1,1)*A(3,2)
+ Ainv(3,3)=A(1,1)*A(2,2)-A(1,2)*A(2,1)
+ det=dot_product(A(1,:),Ainv(1,:)); Ainv=Ainv/det
+end subroutine
+
+!============================================================
+! Direct sum (OpenMP)
+subroutine direct_space_sum(no_ion,Rcut,ion_coord,ion_frac_coord,coord,ewald_coeff,direct_sum,atom_m)
+ integer,intent(in)::no_ion,Rcut
+ real(wp),intent(in)::ion_coord(no_ion,3),ion_frac_coord(no_ion,4)
+ real(wp),intent(in)::coord(3,3),ewald_coeff
+ real(wp),intent(inout)::atom_m(no_ion)
+ real(wp),intent(out)::direct_sum
+ integer::ntot,kk,i,j,k,n1,n2,n3,tid,nthreads
+ real(wp),allocatable::trans(:,:),mad_acc(:,:)
+ real(wp)::dist(3),tvec(3),rr,qq
+
+ ntot=(2*Rcut+1)**3-1
+ allocate(trans(3,ntot)); kk=0
+ do n1=-Rcut,Rcut; do n2=-Rcut,Rcut; do n3=-Rcut,Rcut
+   if(n1==0.and.n2==0.and.n3==0)cycle
+   kk=kk+1; trans(:,kk)=n1*coord(:,1)+n2*coord(:,2)+n3*coord(:,3)
+ enddo;enddo;enddo
+ if(kk<ntot) ntot=kk
+
+ nthreads=omp_get_max_threads()
+ allocate(mad_acc(no_ion,nthreads)); mad_acc=0.0_wp
+ direct_sum=0.0_wp
+ !$omp parallel default(none)shared(no_ion,ion_coord,ion_frac_coord,trans,ntot,ewald_coeff,mad_acc) &
+ !$omp private(i,j,k,dist,tvec,rr,qq,tid) reduction(+:direct_sum)
+ tid=omp_get_thread_num()+1
+ !$omp do
+ do i=1,no_ion
+   do j=i+1,no_ion
+     dist=ion_coord(i,:)-ion_coord(j,:); qq=ion_frac_coord(i,4)*ion_frac_coord(j,4)
+     do k=1,ntot
+       tvec=trans(:,k); rr=sqrt(sum((dist+tvec)**2))
+       if(rr>1.0e-12_wp)then
+        direct_sum=direct_sum+qq*erfc(ewald_coeff*rr)/rr
+        mad_acc(i,tid)=mad_acc(i,tid)+ion_frac_coord(j,4)*erfc(ewald_coeff*rr)/rr
+        mad_acc(j,tid)=mad_acc(j,tid)+ion_frac_coord(i,4)*erfc(ewald_coeff*rr)/rr
+       endif
+     enddo
+   enddo
+ enddo
+ !$omp end do
+ !$omp end parallel
+ do i = 1, no_ion
+     atom_m(i) = atom_m(i) + sum(mad_acc(i,:))
+ end do
+
+
+ deallocate(trans,mad_acc)
+end subroutine
+
+!============================================================
+! Reciprocal Ewald
+subroutine reciprocal_ewald(no_ion,ion_frac,ion_coord,coord_rec,Gcut,ewald_coeff,volume,resultat,atom_m)
+ integer,intent(in)::no_ion,Gcut
+ real(wp),intent(in)::ion_frac(no_ion,4),ion_coord(no_ion,3),coord_rec(3,3)
+ real(wp),intent(in)::ewald_coeff,volume
+ real(wp),intent(out)::resultat,atom_m(no_ion)
+ real(wp)::g1(3),g2(3),g3(3),rec_vec(3),g2sq,pi,t1,t2
+ complex(wp)::S,res_c,imag_unit
+ integer::m1,m2,m3,i
+ pi=2.0_wp*acos(0.0_wp); imag_unit=cmplx(0.0_wp,1.0_wp,kind=wp)
+ g1=coord_rec(:,1); g2=coord_rec(:,2); g3=coord_rec(:,3)
+ res_c=(0.0_wp,0.0_wp); atom_m=0.0_wp
+ call cpu_time(t1)
+ do m1=-Gcut,Gcut; do m2=-Gcut,Gcut; do m3=-Gcut,Gcut
+  if(m1/=0.or.m2/=0.or.m3/=0)then
+   rec_vec=m1*g1+m2*g2+m3*g3; g2sq=dot_product(rec_vec,rec_vec)
+   S=(0.0_wp,0.0_wp)
+   do i=1,no_ion
+     S=S+ion_frac(i,4)*exp(2.0_wp*pi*imag_unit*dot_product(rec_vec,ion_coord(i,:)))
+   enddo
+   res_c=res_c+0.5_wp*exp(-pi**2*g2sq/ewald_coeff**2)*(S*conjg(S))/(volume*pi*g2sq)
+   do i=1,no_ion
+     atom_m(i)=atom_m(i)+exp(-pi**2*g2sq/ewald_coeff**2)/(volume*pi*g2sq)* &
+     real(exp(-2.0_wp*pi*imag_unit*dot_product(rec_vec,ion_coord(i,:)))*S)
+   enddo
+  endif
+ enddo;enddo;enddo
+ call cpu_time(t2); print*,"Ewald Reciprocal time=",t2-t1
+ resultat=real(res_c,wp)
+end subroutine
+!============================================================
+subroutine FFT_INVERSE(nx,ny,nz,C,psi)
+ use, intrinsic :: iso_c_binding
+ integer(c_int),intent(in)::nx,ny,nz
+ complex(c_double_complex),target,intent(in)::C(0:nx-1,0:ny-1,0:nz-1)
+ complex(c_double_complex),target,intent(out)::psi(0:nx-1,0:ny-1,0:nz-1)
+ type(c_ptr)::plan_inv
+ integer(c_int),parameter::FFTW_BACKWARD=1,FFTW_ESTIMATE=64
+ interface
+   function fftw_plan_dft_3d(n1,n2,n3,in,out,sign,flags) bind(C,name="fftw_plan_dft_3d")
+     use iso_c_binding
+     integer(c_int),value::n1,n2,n3,sign,flags
+     type(c_ptr),value::in,out; type(c_ptr)::fftw_plan_dft_3d
+   end function
+   subroutine fftw_execute_dft(plan,in,out) bind(C,name="fftw_execute_dft")
+     use iso_c_binding; type(c_ptr),value::plan,in,out
+   end subroutine
+   subroutine fftw_destroy_plan(plan) bind(C,name="fftw_destroy_plan")
+     use iso_c_binding; type(c_ptr),value::plan
+   end subroutine
+ end interface
+ plan_inv=fftw_plan_dft_3d(nx,ny,nz,c_loc(C(0,0,0)),c_loc(psi(0,0,0)),FFTW_BACKWARD,FFTW_ESTIMATE)
+ call fftw_execute_dft(plan_inv,c_loc(C(0,0,0)),c_loc(psi(0,0,0)))
+ call fftw_destroy_plan(plan_inv)
+end subroutine
+
+!============================================================
+
+subroutine FFT_forward_3d(nx, ny, nz, C, psi)
+    use iso_c_binding
+    implicit none
+    integer(c_int), intent(in) :: nx, ny, nz
+    complex(c_double_complex), target, intent(in)  :: C(0:nx-1,0:ny-1,0:nz-1)
+    complex(c_double_complex), target, intent(out) :: psi(0:nx-1,0:ny-1,0:nz-1)
+    type(c_ptr) :: plan
+
+    interface
+        function fftw_plan_dft_3d(n1,n2,n3,in,out,sign,flags) bind(C,name="fftw_plan_dft_3d")
+            use iso_c_binding
+            integer(c_int), value :: n1,n2,n3,sign,flags
+            type(c_ptr), value :: in,out
+            type(c_ptr) :: fftw_plan_dft_3d
+        end function
+
+        subroutine fftw_execute_dft(plan, in, out) bind(C,name="fftw_execute_dft")
+            use iso_c_binding
+            type(c_ptr), value :: plan, in, out
+        end subroutine
+
+        subroutine fftw_destroy_plan(plan) bind(C,name="fftw_destroy_plan")
+            use iso_c_binding
+            type(c_ptr), value :: plan
+        end subroutine
+    end interface
+
+    ! Plan with FFTW_MEASURE to avoid segfaults
+    plan = fftw_plan_dft_3d(nx, ny, nz, c_loc(C(0,0,0)), c_loc(psi(0,0,0)), -1, 0)
+
+    ! Execute
+    call fftw_execute_dft(plan, c_loc(C(0,0,0)), c_loc(psi(0,0,0)))
+
+    ! Free plan
+    call fftw_destroy_plan(plan)
+end subroutine
+
+!============================================================
+subroutine fft_forward(input_complex,output_complex,nfft)
+ use, intrinsic :: iso_c_binding
+ integer(c_int),intent(in)::nfft
+ complex(c_double_complex),target,intent(in)::input_complex(0:nfft-1)
+ complex(c_double_complex),target,intent(out)::output_complex(0:nfft-1)
+ interface
+   function fftw_plan_dft_1d(n,in,out,sign,flags) bind(C,name="fftw_plan_dft_1d")
+     use iso_c_binding; integer(c_int),value::n,sign,flags
+     type(c_ptr),value::in,out; type(c_ptr)::fftw_plan_dft_1d
+   end function
+   subroutine fftw_execute_dft(plan,in,out) bind(C,name="fftw_execute_dft")
+     use iso_c_binding; type(c_ptr),value::plan,in,out
+   end subroutine
+   subroutine fftw_destroy_plan(plan) bind(C,name="fftw_destroy_plan")
+     use iso_c_binding; type(c_ptr),value::plan
+   end subroutine
+ end interface
+ type(c_ptr)::plan
+ integer(c_int),parameter::FFTW_FORWARD=-1,FFTW_ESTIMATE=64
+ plan=fftw_plan_dft_1d(nfft,c_loc(input_complex(0)),c_loc(output_complex(0)),FFTW_FORWARD,FFTW_ESTIMATE)
+ call fftw_execute_dft(plan,c_loc(input_complex(0)),c_loc(output_complex(0)))
+ call fftw_destroy_plan(plan)
+end subroutine
+
+!============================================================
+function one_pass_bspline(array,val,n) result(outarray)
+ real(wp),intent(in)::array(:),val; integer,intent(in)::n
+ real(wp)::outarray(0:size(array)-1)
+ real(wp)::div; integer::j
+ outarray=array; div=1.0_wp/real(n-1,kind=wp)
+ outarray(n-1)=div*val*outarray(n-2)
+ do j=1,n-2
+   outarray(n-j-1)=div*((val+real(j,kind=wp))*outarray(n-j-2)+ &
+                 (real(n-j,kind=wp)-val)*outarray(n-j-1))
+ enddo
+ outarray(0)=outarray(0)*div*(1.0_wp-val)
+end function
+
+function build_spline(order,u) result(spline)
+ integer,intent(in)::order; real(wp),intent(in)::u
+ real(wp)::spline(0:order-1),array(0:order-1)
+ integer::m
+ array=0.0_wp; array(0)=1.0_wp-u; array(1)=u
+ do m=1,order-2; array=one_pass_bspline(array,u,m+2); enddo
+ spline=array
+end function
+
+function build_spline_derivative(order,u) result(dspline)
+ integer,intent(in)::order; real(wp),intent(in)::u
+ real(wp)::dspline(0:order-1),array(0:order-1),prev(0:order-1)
+ integer::m
+ array=0.0_wp; array(0)=1.0_wp-u; array(1)=u
+ do m=1,order-3; array=one_pass_bspline(array,u,m+2); enddo
+ prev=array; array=one_pass_bspline(array,u,order)
+ dspline=0.0_wp; dspline(0)=-prev(0)
+ do m=1,order-2; dspline(m)=prev(m-1)-prev(m); enddo
+ dspline(order-1)=prev(order-2)
+end function
+
+function dftmod(order,n) result(modulus)
+ integer,intent(in)::order,n
+ real(wp)::modulus(0:n-1)
+ complex(wp)::transform(0:n-1),spline_complex(0:n-1)
+ real(wp)::spline(0:n-1); integer::i
+ spline=0.0_wp; spline(0:order-1)=build_spline(order,0.0_wp)
+ spline_complex=cmplx(spline,0.0_wp,kind=wp)
+ call fft_forward(spline_complex,transform,n)
+ do i=0,n-1; modulus(i)=real(transform(i),kind=wp)**2+aimag(transform(i))**2; enddo
+end function
+
+!============================================================
+subroutine spme_energy(ewald_coeff,grid_size,splineorder,a,b,c,coords,charges,natoms,energy,atom_m)
+ real(wp),intent(in)::ewald_coeff,a(3),b(3),c(3)
+ integer,intent(in)::grid_size(3),splineorder,natoms
+ real(wp),intent(in)::coords(natoms,3),charges(natoms)
+ real(wp),intent(out)::energy,atom_m(natoms)
+ ! Locals
+ integer::nx,ny,nz,i,j,k,atom,ix,iy,iz,shift_x,shift_y,shift_z
+ real(wp)::volume,pi2_a2,q,phi_val,mx,my,mz,dmx,dmy,dmz
+ real(wp)::recip_a(3),recip_b(3),recip_c(3),kvec(3),pi
+ real(wp)::cell(3,3),inv_cell(3,3),t1,t2
+ real(wp),allocatable::red(:,:),spl(:,:,:),dspl(:,:,:),Qgrid(:,:,:),phi(:,:,:)
+ real(wp),allocatable::splmod_x(:),splmod_y(:),splmod_z(:)
+ integer,allocatable::gridstart(:,:)
+ real(wp),allocatable::gF(:,:,:),m2(:,:,:),forces(:,:)
+ complex(wp),allocatable::Sm(:,:,:),conv(:,:,:),phi_c(:,:,:),Qgrid_complex(:,:,:)
+
+ pi=3.141592653589793_wp
+ nx=grid_size(1); ny=grid_size(2); nz=grid_size(3)
+ volume=dot_product(a,cross_product(b,c))
+ recip_a=cross_product(b,c)/volume
+ recip_b=cross_product(c,a)/volume
+ recip_c=cross_product(a,b)/volume
+ pi2_a2=merge(pi**2/ewald_coeff**2,1.0e50_wp,ewald_coeff/=0.0_wp)
+print*, '4'
+ allocate(red(natoms,3),spl(natoms,3,0:splineorder-1),dspl(natoms,3,0:splineorder-1))
+ allocate(gridstart(natoms,3),Qgrid(0:nz-1,0:ny-1,0:nx-1)); Qgrid=0.0_wp
+ cell(:,1)=a; cell(:,2)=b; cell(:,3)=c; call invert_3x3_matrix(cell,inv_cell)
+ do atom=1,natoms
+   red(atom,:)=matmul(inv_cell,coords(atom,:))
+   gridstart(atom,1)=floor(nx*red(atom,1),kind=wp)
+   gridstart(atom,2)=floor(ny*red(atom,2),kind=wp)
+   gridstart(atom,3)=floor(nz*red(atom,3),kind=wp)
+   spl(atom,1,:)=build_spline(splineorder,nx*red(atom,1)-gridstart(atom,1))
+   spl(atom,2,:)=build_spline(splineorder,ny*red(atom,2)-gridstart(atom,2))
+   spl(atom,3,:)=build_spline(splineorder,nz*red(atom,3)-gridstart(atom,3))
+   dspl(atom,1,:)=build_spline_derivative(splineorder,nx*red(atom,1)-gridstart(atom,1))
+   dspl(atom,2,:)=build_spline_derivative(splineorder,ny*red(atom,2)-gridstart(atom,2))
+   dspl(atom,3,:)=build_spline_derivative(splineorder,nz*red(atom,3)-gridstart(atom,3))
+ enddo
+print*, '3'
+ do atom=1,natoms
+   q=charges(atom)
+   do i=0,splineorder-1; do j=0,splineorder-1; do k=0,splineorder-1
+     Qgrid(mod(gridstart(atom,3)+k,nz),mod(gridstart(atom,2)+j,ny),mod(gridstart(atom,1)+i,nx))=&
+     Qgrid(mod(gridstart(atom,3)+k,nz),mod(gridstart(atom,2)+j,ny),mod(gridstart(atom,1)+i,nx))+&
+     q*spl(atom,1,i)*spl(atom,2,j)*spl(atom,3,k)
+   enddo;enddo;enddo
+ enddo
+!print*, Qgrid
+print*, 'pred'
+ allocate(Sm(0:nz-1,0:ny-1,0:nx-1))
+ print*, 'potoa'
+ !call FFT_forward_3d(nx,ny,nz,cmplx(Qgrid,0.0_wp,wp),Sm)
+
+ allocate(Qgrid_complex(0:nx-1,0:ny-1,0:nz-1))
+ Qgrid_complex = cmplx(Qgrid, 0.0_wp, wp)  ! copy data to a contiguous array
+ call FFT_forward_3d(nx, ny, nz, Qgrid_complex, Sm)
+
+ print*, 'KJSDHFKLJDSHKJSDHFKLJDSHFF'
+!print*, Sm
+print*, '2'
+ allocate(splmod_x(0:nx-1)); splmod_x=1.0_wp/dftmod(splineorder,nx)
+ allocate(splmod_y(0:ny-1)); splmod_y=1.0_wp/dftmod(splineorder,ny)
+ allocate(splmod_z(0:nz-1)); splmod_z=1.0_wp/dftmod(splineorder,nz)
+
+ allocate(m2(0:nz-1,0:ny-1,0:nx-1),gF(0:nz-1,0:ny-1,0:nx-1))
+        do i = 0, nx-1
+            shift_x = i
+            if (i >= (nx)/2) then
+                shift_x = i-nx
+            end if
+            do j = 0, ny-1
+                shift_y = j
+                if (j >= (ny)/2) then
+                    shift_y = j - ny
+                end if
+                do k = 0, nz-1
+                    shift_z = k
+                    if (k >= (nz)/2) then
+                        shift_z = k - nz
+                    end if
+                    kvec = shift_x*recip_a + shift_y*recip_b + shift_z*recip_c
+                    m2(k,j,i) = dot_product(kvec, kvec)
+                    if (i == 0 .and. j == 0 .and. k == 0) m2(k,j,i) = huge(1.0_wp)
+                    gF(k,j,i) = splmod_x(i) * splmod_y(j) * splmod_z(k) * exp(-pi2_a2 * m2(k,j,i)) / m2(k,j,i)
+                end do
+            end do
+        end do
+print*, '1'
+ allocate(conv(0:nz-1,0:ny-1,0:nx-1)); conv=Sm*cmplx(gF,0.0_wp,wp)
+ allocate(phi_c(0:nz-1,0:ny-1,0:nx-1))
+!print*, conv
+ call FFT_INVERSE(nx,ny,nz,conv,phi_c)
+ allocate(phi(0:nz-1,0:ny-1,0:nx-1)); phi=real(phi_c,wp)
+!print*, phi
+ energy=0.0_wp; atom_m=0.0_wp; allocate(forces(natoms,3)); forces=0.0_wp
+ do atom=1,natoms
+   q=charges(atom)
+   do i=0,splineorder-1; do j=0,splineorder-1; do k=0,splineorder-1
+     ix=mod(gridstart(atom,1)+i,nx)
+     iy=mod(gridstart(atom,2)+j,ny)
+     iz=mod(gridstart(atom,3)+k,nz)
+     phi_val=phi(iz,iy,ix)
+     mx=spl(atom,1,i); dmx=dspl(atom,1,i)*nx/sqrt(dot_product(a,a))
+     my=spl(atom,2,j); dmy=dspl(atom,2,j)*ny/sqrt(dot_product(b,b))
+     mz=spl(atom,3,k); dmz=dspl(atom,3,k)*nz/sqrt(dot_product(c,c))
+     energy=energy+q*mx*my*mz*phi_val/(2.0_wp*pi*volume)
+     atom_m(atom)=atom_m(atom)+mx*my*mz*phi_val/(pi*volume)
+     forces(atom,1)=forces(atom,1)-q*dmx*my*mz*phi_val/(pi*volume)
+     forces(atom,2)=forces(atom,2)-q*mx*dmy*mz*phi_val/(pi*volume)
+     forces(atom,3)=forces(atom,3)-q*mx*my*dmz*phi_val/(pi*volume)
+   enddo;enddo;enddo
+ enddo
+!print*, phi
+ !call write_matrix(forces,"SPME forces")
+ call cpu_time(t2); print*,"SPME time=",t2-t1
+end subroutine
+
+
+end module PME_main
